@@ -50,6 +50,30 @@ def msg_key(msg: dict) -> str:
     payload = json.dumps(m, sort_keys=True, ensure_ascii=False)
     return hashlib.md5(payload.encode()).hexdigest()
 
+def strip_image_content(messages):
+    """
+    遍历消息，移除所有 'image_url' 类型的内容块。
+    如果某条消息的 content 是数组，过滤后只保留 'text' 块；
+    如果过滤后数组为空，则替换为一个占位文本，避免模型收到空 content。
+    """
+    for msg in messages:
+        content = msg.get('content')
+        if not isinstance(content, list):
+            continue  # 字符串 content 无需处理
+
+        text_parts = [
+            part for part in content
+            if part.get('type') == 'text'
+        ]
+
+        if not text_parts:
+            # 所有内容都被过滤掉了（例如纯图片消息）
+            msg['content'] = "[用户发送了一张图片，但当前模型不支持图片输入，请以文本方式回应]"
+        else:
+            # 保留文本块，移除图片块
+            msg['content'] = text_parts
+    return messages
+
 @app.route('/v1/chat/completions', methods=['POST'])
 @app.route('/chat/completions', methods=['POST'])
 def chat_completions():
@@ -74,6 +98,8 @@ def chat_completions():
                     msg['reasoning_content'] = ""
                     logger.info(f"→ No cached reasoning for msg[{idx}], set empty. key={key[:8]}...")
 
+    # ----- 过滤掉所有 image_url 内容块 -----
+    body['messages'] = strip_image_content(body.get('messages', []))
     body['stream'] = True
     headers = {
         "Authorization": request.headers.get("Authorization", ""),
@@ -102,18 +128,44 @@ def chat_completions():
         else:
             break
 
+    # ----- 优化错误返回：统一 JSON 格式，针对图片错误给出友好提示 -----
     if resp is None or resp.status_code != 200:
-        detail = ""
         if resp is not None:
             try:
-                detail = resp.text[:500]
+                err_data = resp.json()
+                err_msg = err_data.get('error', {}).get('message', '')
+                # 如果错误仍与图片相关（双重保险），给出更明确的提示
+                if 'image_url' in err_msg:
+                    friendly_error = {
+                        "error": {
+                            "message": "当前模型不支持图片输入，请移除图片内容或使用支持视觉的模型（如 deepseek-chat）。",
+                            "type": "unsupported_media",
+                            "code": "image_not_supported"
+                        }
+                    }
+                    logger.warning("Upstream image error, returning friendly message.")
+                    return Response(
+                        json.dumps(friendly_error, ensure_ascii=False),
+                        status=400,
+                        mimetype='application/json'
+                    )
             except:
                 pass
-        logger.error(f"DeepSeek returned {resp.status_code if resp else 'None'}. Detail: {detail}")
+
+        # 通用错误处理：统一返回 JSON，避免透传上游可能不规范的错误体
+        error_body = {
+            "error": {
+                "message": "上游服务返回错误，请稍后重试。",
+                "type": "upstream_error",
+                "code": str(resp.status_code) if resp else "502",
+                "detail": (resp.text[:200] if resp else "no response")
+            }
+        }
+        logger.error(f"Upstream error {resp.status_code if resp else 'None'}, detail: {resp.text[:500] if resp else 'None'}")
         return Response(
-            resp.content if resp else json.dumps({"error": "upstream failure"}),
+            json.dumps(error_body, ensure_ascii=False),
             status=resp.status_code if resp else 502,
-            headers=dict(resp.headers) if resp else {"Content-Type": "application/json"}
+            mimetype='application/json'
         )
 
     # ===== 流式处理：完整收集 content 和 tool_calls =====
